@@ -33,6 +33,12 @@ class ArgumentError(BubblesError):
     """Raised when wrong argument is passed to a function"""
     pass
 
+class DecimalError(ArgumentError, ValueError):
+    """Raised when a value can not be represented as an exact decimal: it is
+    not a number, it is not finite, it has more digits than the declared
+    precision or it would require rounding to the declared scale."""
+    pass
+
 class ProbeAssertionError(BubblesError):
     """Raised when probe assertion fails"""
     def __init__(self, reason=None):

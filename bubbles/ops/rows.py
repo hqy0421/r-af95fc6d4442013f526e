@@ -13,6 +13,8 @@ from ..objects import *
 from ..dev import experimental
 from ..prototypes import *
 from ..datautil import to_bool
+from ..numeric import (DECIMAL_STORAGE_TYPE, coerce_decimal,
+                       parse_decimal_storage_type)
 
 from datetime import datetime
 from time import strptime
@@ -66,16 +68,41 @@ def _(ctx, obj, typemap):
     converters = []
     for field in obj.fields:
         new_type = typemap.get(field.name)
-        if new_type and new_type != field.storage_type:
+        new_type, precision, scale = parse_decimal_storage_type(new_type)
+
+        if new_type == DECIMAL_STORAGE_TYPE:
+            # Decimals are always validated, even when the storage type does
+            # not change.
+            if precision is None and scale is None:
+                precision, scale = field.decimal_parameters()
+            conv = _decimal_converter(precision, scale)
+        elif new_type and new_type != field.storage_type:
             conv = _default_type_converters[new_type]
         else:
             conv = None
         converters.append(conv)
 
-        field = field.clone(storage_type=new_type or field.storage_type)
+        attributes = {}
+        if new_type:
+            attributes["storage_type"] = new_type
+        if new_type == DECIMAL_STORAGE_TYPE:
+            attributes["precision"] = precision
+            attributes["scale"] = scale
+        elif new_type:
+            attributes["precision"] = None
+            attributes["scale"] = None
+
+        field = field.clone(**attributes)
         fields.append(field)
 
     return IterableDataSource(converter(converters, obj), fields)
+
+
+def _decimal_converter(precision=None, scale=None):
+    def convert(value):
+        return coerce_decimal(value, precision, scale)
+
+    return convert
 
 @field_filter.register("rows")
 def _(ctx, iterator, keep=None, drop=None, rename=None, filter=None):
@@ -149,21 +176,43 @@ def _(ctx, iterator, field, low, high, discard=False):
 
     fields = iterator.fields
     index = fields.index(field)
+    field_obj = fields.field(field)
 
-    if discard:
-        if high is None and low is not None:
-            predicate = lambda row: not (low <= row[index])
-        elif low is None and high is not None:
-            predicate = lambda row: not (row[index] <= high)
+    if field_obj.is_decimal():
+        # Missing values never match a range, same as in SQL. Boundaries are
+        # normalized to decimals so that comparisons stay exact.
+        if low is not None:
+            low = coerce_decimal(low)
+        if high is not None:
+            high = coerce_decimal(high)
+
+        def in_range(row):
+            value = row[index]
+            if value is None:
+                return False
+            if high is None and low is not None:
+                return low <= value
+            elif low is None and high is not None:
+                return value <= high
+            else:
+                return low <= value <= high
+
+        if discard:
+            predicate = lambda row: row[index] is not None and not in_range(row)
         else:
-            predicate = lambda row: not (low <= row[index] <= high)
+            predicate = in_range
     else:
         if high is None and low is not None:
-            predicate = lambda row: low <= row[index]
+            matches = lambda row: low <= row[index]
         elif low is None and high is not None:
-            predicate = lambda row: row[index] <= high
+            matches = lambda row: row[index] <= high
         else:
-            predicate = lambda row: low <= row[index] <= high
+            matches = lambda row: low <= row[index] <= high
+
+        if discard:
+            predicate = lambda row: not matches(row)
+        else:
+            predicate = matches
 
     return filter(predicate, iterator)
 
@@ -373,16 +422,24 @@ def _(ctx, obj, orderby):
 
     for field, order in reversed(orderby):
         index = obj.fields.index(field)
+        field_obj = obj.fields.field(field)
+
+        if field_obj.is_decimal():
+            # Keep the same NULL placement as the SQL backend: missing
+            # values come first in ascending order and last in descending
+            # order.
+            key = lambda row, index=index: (row[index] is not None, row[index])
+        else:
+            key = operator.itemgetter(index)
 
         if order.startswith("asc"):
             reverse = False
         elif order.startswith("desc"):
             reverse = True
         else:
-            raise ValueError("Unknown order %s for column %s") % (order, column)
+            raise ValueError("Unknown order %s for column %s" % (order, field))
 
-        iterator = sorted(iterator, key=operator.itemgetter(index),
-                                    reverse=reverse)
+        iterator = sorted(iterator, key=key, reverse=reverse)
 
     return iterator
 
@@ -399,6 +456,40 @@ def agg_average(a, value):
 def agg_average_finalize(a):
     return a[1]/a[0]
 
+def agg_decimal_sum(a, value):
+    """Sum of decimals ignoring `None` values. Returns `None` when no value
+    was seen yet, which makes an all-`None` group result in `None`."""
+    if value is None:
+        return a
+    if a is None:
+        return value
+    return a + value
+
+def agg_decimal_min(a, value):
+    if value is None:
+        return a
+    if a is None:
+        return value
+    return min(a, value)
+
+def agg_decimal_max(a, value):
+    if value is None:
+        return a
+    if a is None:
+        return value
+    return max(a, value)
+
+def agg_decimal_average(a, value):
+    if value is None:
+        return a
+    total = value if a[1] is None else a[1] + value
+    return (a[0]+1, total)
+
+def agg_decimal_average_finalize(a):
+    if a[0] == 0:
+        return None
+    return a[1]/a[0]
+
 AggregationFunction = namedtuple("AggregationFunction",
                             ["func", "start", "finalize"])
 aggregation_functions = {
@@ -406,6 +497,16 @@ aggregation_functions = {
             "min": AggregationFunction(min, 0, None),
             "max": AggregationFunction(max, 0, None),
             "average": AggregationFunction(agg_average, (0,0), agg_average_finalize)
+        }
+
+"""Aggregation implementations for exact decimal measures. Decimal values
+are never coerced to float and `None` values are ignored."""
+decimal_aggregation_functions = {
+            "sum": AggregationFunction(agg_decimal_sum, None, None),
+            "min": AggregationFunction(agg_decimal_min, None, None),
+            "max": AggregationFunction(agg_decimal_max, None, None),
+            "average": AggregationFunction(agg_decimal_average, (0, None),
+                                           agg_decimal_average_finalize)
         }
 
 @aggregate.register("rows")
@@ -438,9 +539,10 @@ def _(ctx, obj, key, measures=None, include_count=True,
             row = list(key[:])
 
             key_aggregate = aggregates[key]
-            for i, (measure, index, function) in enumerate(measure_aggregates):
+            for i, (measure, index, function) in \
+                                            enumerate(measure_aggregates):
                 aggregate = key_aggregate[i]
-                finalize = aggregation_functions[function].finalize
+                finalize = function.finalize
                 if finalize:
                     row.append(finalize(aggregate))
                 else:
@@ -470,12 +572,24 @@ def _(ctx, obj, key, measures=None, include_count=True,
         index = obj.fields.index(name)
         aggregate = measure[1]
 
-        measure_aggregates.append( (name, index, aggregate) )
+        field = obj.fields.field(name)
+
+        if field.is_decimal():
+            functions = decimal_aggregation_functions
+        else:
+            functions = aggregation_functions
+
+        try:
+            function = functions[aggregate]
+        except KeyError:
+            raise OperationError("Unknown aggregation '%s'" % aggregate)
+
+        measure_aggregates.append( (name, index, function) )
         measure_fields.add(name)
 
-        field = obj.fields.field(name)
         field = field.clone(name="%s_%s" % (name, aggregate),
                             analytical_type="measure")
+        field = aggregated_field(field, aggregate)
         out_fields.append(field)
 
     if include_count:
@@ -505,15 +619,14 @@ def _(ctx, obj, key, measures=None, include_count=True,
             keys.add(key)
             key_aggregate = []
             for measure, index, function in measure_aggregates:
-                start = aggregation_functions[function].start
-                key_aggregate.append(start)
+                key_aggregate.append(function.start)
             if include_count:
                 key_aggregate.append(0)
 
             aggregates[key] = key_aggregate
 
         for i, (measure, index, function) in enumerate(measure_aggregates):
-            func = aggregation_functions[function].func
+            func = function.func
             key_aggregate[i] = func(key_aggregate[i], row[index])
 
         if include_count:

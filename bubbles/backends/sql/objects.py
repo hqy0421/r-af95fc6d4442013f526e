@@ -4,6 +4,9 @@ from ...errors import *
 from ...common import get_logger
 from ...metadata import Field, FieldList
 from ...stores import DataStore
+from ...numeric import (DECIMAL_STORAGE_TYPE, coerce_decimal,
+                        register_sqlite_decimal_functions)
+from .types import SQLDecimal
 
 __all__ = (
         "SQLDataStore",
@@ -17,6 +20,7 @@ try:
     import sqlalchemy.sql as sql
     # (sql type, storage type, analytical type)
     _sql_to_bubbles_types = (
+        (SQLDecimal, "decimal", "measure"),
         (sqlalchemy.types.UnicodeText, "text", "typeless"),
         (sqlalchemy.types.Text, "text", "typeless"),
         (sqlalchemy.types.Unicode, "string", "nominal"),
@@ -40,6 +44,7 @@ try:
         "binary": sqlalchemy.types.Binary,
         "integer": sqlalchemy.types.Integer,
         "number": sqlalchemy.types.Numeric,
+        "decimal": SQLDecimal,
         "boolean": sqlalchemy.types.SmallInteger
     }
 
@@ -53,6 +58,14 @@ try:
 
     @compiles(CreateTableAsSelect)
     def visit_create_table_as_select(element, compiler, **kw):
+        # SQLite (and PostgreSQL) do not accept a parenthesised SELECT
+        # clause here, MySQL requires it.
+        if compiler.dialect.name in ("sqlite", "postgresql"):
+            return "CREATE TABLE %s AS %s" % (
+                element.table,
+                compiler.process(element.select)
+            )
+
         return "CREATE TABLE %s AS (%s)" % (
             element.table,
             compiler.process(element.select)
@@ -90,11 +103,25 @@ except ImportError:
 DEFAULT_STRING_LENGTH = 126
 
 
+def _sqlite_on_connect(dbapi_connection, connection_record=None):
+    """Registers the exact decimal functions on a new SQLite connection."""
+    register_sqlite_decimal_functions(dbapi_connection)
+
+
 def concrete_storage_type(field, type_map={}, dialect=None):
     """Derives a concrete storage type for the field based on field conversion
        dictionary"""
 
     concrete_type = field.concrete_storage_type
+
+    # A decimal field might have been cloned with adjusted precision and
+    # scale (for example an aggregated or summed measure). The concrete type
+    # has to follow the field's parameters.
+    if isinstance(concrete_type, SQLDecimal):
+        precision, scale = field.decimal_parameters()
+        if (concrete_type.precision, concrete_type.scale) != (precision,
+                                                              scale):
+            return SQLDecimal(precision, scale)
 
     if not isinstance(concrete_type, sqlalchemy.types.TypeEngine):
         if type_map:
@@ -112,6 +139,10 @@ def concrete_storage_type(field, type_map={}, dialect=None):
                 length = field.size
 
             concrete_type = sqlalchemy.types.Unicode(length=length)
+
+        if concrete_type == SQLDecimal:
+            precision, scale = field.decimal_parameters()
+            concrete_type = SQLDecimal(precision, scale)
 
         if not concrete_type:
             raise ValueError("unable to find concrete storage type for field '%s' "
@@ -141,11 +172,11 @@ def reflect_fields(selectable):
                 field.analytical_type = conv[2]
                 break
 
-        if field.storage_type is not None:
-            field.storaget_tpye = "unknown"
-
-        if field.analytical_type is not None:
-            field.analytical_type = "unknown"
+        if field.storage_type == DECIMAL_STORAGE_TYPE:
+            field.precision = getattr(column.type, "precision", None)
+            field.scale = getattr(column.type, "scale", None)
+            if field.scale is None and field.precision is not None:
+                field.scale = 0
 
         fields.append(field)
 
@@ -254,6 +285,22 @@ class SQLDataStore(DataStore):
         self.schema = schema
         self.logger = get_logger()
 
+        self._register_functions()
+
+    def _register_functions(self):
+        """Register helper functions required by the backend, such as exact
+        decimal aggregates."""
+
+        if self.connectable.dialect.name != "sqlite":
+            return
+
+        try:
+            sqlalchemy.event.listen(self.connectable, "connect",
+                                    _sqlite_on_connect)
+        except Exception:
+            self.logger.debug("Unable to register SQLite decimal functions",
+                              exc_info=True)
+
     def clone(self, schema=None, concrete_type_map=None):
         store = SQLDataStore(connectable=self.connectable,
                              schema=schema or self.schema,
@@ -261,6 +308,17 @@ class SQLDataStore(DataStore):
                                                      self.concrete_type_map
                              )
         return store
+
+    def close(self):
+        """Closes the store. The connection is disposed only when it was
+        created by the store. Field metadata, including decimal precision
+        and scale, is always reconstructed from the database, therefore a
+        new store opened on the same database needs no field descriptions."""
+
+        if getattr(self, "should_close", False):
+            dispose = getattr(self.connectable, "dispose", None)
+            if dispose:
+                dispose()
 
     def objects(self, names=None):
         """Return list of tables and views.
@@ -301,7 +359,7 @@ class SQLDataStore(DataStore):
                             fields=fields,
                             schema=self.schema)
 
-    def create(self, name, fields, replace=False, from_obj=None, schema=None,
+    def create(self, name, fields=None, replace=False, from_obj=None, schema=None,
                id_column=None):
         """Creates a table and returns `SQLTable`. See `create_table()`
         for more information"""
@@ -311,7 +369,7 @@ class SQLDataStore(DataStore):
         return SQLTable(store=self, table=table, fields=fields,
                                 schema=schema)
 
-    def create_table(self, name, fields, replace=False, from_obj=None, schema=None,
+    def create_table(self, name, fields=None, replace=False, from_obj=None, schema=None,
                id_column=None):
         """Creates a new table.
 
@@ -336,12 +394,36 @@ class SQLDataStore(DataStore):
                 schema_str = " (in schema '%s')" % schema if schema else ""
                 raise ObjectExistsError("Table %s%s already exists" % (table, schema_str))
 
-        if from_obj:
+        # Note: a SQLStatement has __len__ (number of rows), an empty source
+        # statement would therefore evaluate as false. Compare to None.
+        if from_obj is not None:
             if id_column:
                 raise ArgumentError("id_column should not be specified when "
                                     "creating table from another object")
 
-            return self._create_table_from(table, from_obj)
+            # Prefer the field metadata of the source object: it carries
+            # storage types (including exact decimal precision and scale)
+            # which `CREATE TABLE AS SELECT` would not preserve. The fields
+            # can only be used when they describe exactly the selected
+            # columns.
+            source_fields = getattr(from_obj, "fields", None)
+            if fields is None and source_fields is not None:
+                selected_names = [column.name
+                                  for column in from_obj.selectable().columns]
+                if source_fields.names() == selected_names:
+                    fields = source_fields
+
+            if fields is None:
+                return self._create_table_from(table, from_obj)
+
+            self._append_columns(table, fields)
+            table.create()
+            self.connectable.execute(
+                        InsertFromSelect(table, from_obj.selectable()))
+
+            # The creator already knows the field descriptions, therefore
+            # there is no need to reflect them back.
+            return table
         elif id_column:
             sequence_name = "seq_%s_%s" % (name, id_column)
             sequence = sqlalchemy.schema.Sequence(sequence_name,
@@ -351,10 +433,18 @@ class SQLDataStore(DataStore):
                                            sequence, primary_key=True)
             table.append_column(col)
 
+        self._append_columns(table, fields, id_column)
+
+        table.create()
+
+        return table
+
+    def _append_columns(self, table, fields, id_column=None):
+        """Appends columns described by `fields` to `table`."""
         for field in fields:
             concrete_type = concrete_storage_type(field, self.concrete_type_map)
             if field.name == id_column:
-                sequence_name = "seq_%s_%s" % (name, id_column)
+                sequence_name = "seq_%s_%s" % (table.name, id_column)
                 sequence = sqlalchemy.schema.Sequence(sequence_name,
                                                       optional=True)
                 col = sqlalchemy.schema.Column(id_column,
@@ -365,18 +455,23 @@ class SQLDataStore(DataStore):
 
             table.append_column(col)
 
-        table.create()
-
-        return table
-
-    def _create_table_from(table, from_obj):
+    def _create_table_from(self, table, from_obj):
         """Creates a table using ``CREATE TABLE ... AS SELECT ...``. The
         `from_obj` should have SQL selectable compatible representation."""
 
         source = from_obj.selectable()
         statement = CreateTableAsSelect(table, source)
         self.connectable.execute(statement)
-        return self.table(name=table, autoload=True)
+
+        name = table.name
+        schema = table.schema
+
+        # The placeholder table was created without autoload, therefore it
+        # has no columns. Remove it from the metadata so that it can be
+        # reflected with the columns of the newly created table.
+        self.metadata.remove(table)
+
+        return self.table(name, schema=schema, autoload=True)
 
     def delete(self, name, schema):
         """Drops table"""
@@ -645,6 +740,15 @@ class SQLTable(SQLDataObject):
 
         self._field_names = self.fields.names()
 
+        # Decimal fields are validated eagerly so that an invalid value is
+        # reported at the moment it is appended, not later in a batch.
+        self._decimal_fields = []
+        for field in self.fields:
+            if field.storage_type == DECIMAL_STORAGE_TYPE:
+                self._decimal_fields.append(field.decimal_parameters())
+            else:
+                self._decimal_fields.append(None)
+
         # Bulk INSERT buffer (if backends supports bulk inserts)
         self.buffer_size = buffer_size
         self._insert_buffer = []
@@ -682,6 +786,14 @@ class SQLTable(SQLDataObject):
     def append(self, row):
         # FIXME: remove this once SQLAlchemy will allow list based multi-insert
         row = dict(zip(self._field_names, row))
+
+        # Validate decimals before buffering, so that an invalid value is
+        # reported here and does not poison the whole batch.
+        for index, decimal in enumerate(self._decimal_fields):
+            if decimal:
+                precision, scale = decimal
+                row[self._field_names[index]] = coerce_decimal(
+                    row[self._field_names[index]], precision, scale)
 
         self._insert_buffer.append(row)
         if len(self._insert_buffer) >= self.buffer_size:

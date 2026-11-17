@@ -7,6 +7,9 @@ import inspect
 import warnings
 from .common import get_logger, IgnoringDictionary
 from .errors import *
+from .numeric import (DECIMAL_STORAGE_TYPE, decimal_parameters,
+                      parse_decimal_storage_type,
+                      DECIMAL_SUM_PRECISION_INCREMENT)
 
 # from collections import OrderedDict
 
@@ -21,6 +24,7 @@ __all__ = [
     "prepare_key",
     "prepare_aggregation_list",
     "prepare_order_list",
+    "aggregated_field",
     "DEFAULT_ANALYTICAL_TYPES"
 ]
 
@@ -31,6 +35,7 @@ storage_types = (
         "text",     # bigger text storage
         "integer",  # integer numeric types
         "number",    # floating point types
+        "decimal",  # exact decimal number with declared precision and scale
 
         "boolean",  # two-state value
 
@@ -67,6 +72,7 @@ DEFAULT_ANALYTICAL_TYPES = {
                 "text": "typeless",
                 "integer": "discrete",
                 "number": "measure",
+                "decimal": "measure",
                 "date": "typeless",
                 "array": "typeless",
                 "document": "typeless"
@@ -81,6 +87,8 @@ FIELD_ATTRIBUTES = (
     "concrete_storage_type",
     "size",
     "missing_value",
+    "precision",
+    "scale",
     "info",
     "origin",
     "description"
@@ -99,7 +107,8 @@ def to_field(obj):
 
     ``tuple``:
         (`field_name`, `storaget_type`, `analytical_type`), the `field_name` is
-        obligatory, rest is optional
+        obligatory, rest is optional. The `storage_type` might also carry
+        decimal parameters, for example ``decimal(18, 2)``.
 
     ``dict``
         contains key-value pairs for initializing a :class:`Field` object
@@ -173,6 +182,11 @@ class Field(object):
       related to the `storage_type` and/or `concrete_storaget_type`. For
       example it might be length of text fields or list of array
       dimensions for array type.
+    * `precision` (optional) – for ``decimal`` storage type: maximum number
+      of significant digits (integer and fractional digits together).
+    * `scale` (optional) – for ``decimal`` storage type: number of digits
+      after the decimal point. When ``precision`` is specified and `scale`
+      is not, the decimal is an integer with ``scale`` of ``0``.
     * `missing_values` (optional) - Array of values that represent missing
       values in the dataset for given field
     * `info` – user specific field information, might contain formatting
@@ -190,7 +204,27 @@ class Field(object):
 
     def __init__(self, name=None, storage_type=None, analytical_type=None,
                  concrete_storage_type=None, size=None, missing_value=None,
-                 label=None, info=None, origin=None, description=None):
+                 label=None, info=None, origin=None, description=None,
+                 precision=None, scale=None):
+
+        storage_type, type_precision, type_scale = \
+                                    parse_decimal_storage_type(storage_type)
+
+        if precision is None:
+            precision = type_precision
+        if scale is None:
+            scale = type_scale
+
+        if storage_type is None and (precision is not None or
+                                     scale is not None):
+            storage_type = DECIMAL_STORAGE_TYPE
+
+        if storage_type == DECIMAL_STORAGE_TYPE:
+            precision, scale = decimal_parameters(precision, scale)
+        else:
+            # Decimal parameters are meaningless for other storage types.
+            precision = None
+            scale = None
 
         self.name = name
         self.storage_type = storage_type
@@ -198,10 +232,38 @@ class Field(object):
         self.concrete_storage_type = concrete_storage_type
         self.size = size
         self.missing_value = missing_value
+        self.precision = precision
+        self.scale = scale
         self.label = label
         self.info = info
         self.origin = origin
         self.description = description
+
+    def is_decimal(self):
+        """Returns `True` when the field is an exact decimal number."""
+        return self.storage_type == DECIMAL_STORAGE_TYPE
+
+    def decimal_parameters(self):
+        """Return ``(precision, scale)`` of a decimal field."""
+        if not self.is_decimal():
+            return None, None
+
+        return decimal_parameters(self.precision, self.scale)
+
+    def storage_type_string(self):
+        """Returns the storage type including decimal parameters, for
+        example ``decimal(18, 2)``."""
+        if not self.is_decimal():
+            return self.storage_type
+
+        precision, scale = self.decimal_parameters()
+
+        if precision is None:
+            return DECIMAL_STORAGE_TYPE
+        if scale is None:
+            return "%s(%d)" % (DECIMAL_STORAGE_TYPE, precision)
+
+        return "%s(%d, %d)" % (DECIMAL_STORAGE_TYPE, precision, scale)
 
     def clone(self, **attributes):
         """Clone a field and set attributes"""
@@ -230,7 +292,9 @@ class Field(object):
                       self.label,
                       copy.deepcopy(self.info, memo),
                       self.origin,
-                      self.description)
+                      self.description,
+                      precision=self.precision,
+                      scale=self.scale)
         return field
 
     def __str__(self):
@@ -254,6 +318,28 @@ class Field(object):
 
     def __ne__(self,other):
         return not self.__eq__(other)
+
+
+def aggregated_field(field, aggregate):
+    """Adjust a cloned measure field for an aggregation.
+
+    A sum of decimals may need more integer digits than the source field.
+    The precision is widened so that derived and aggregated fields describe
+    the result correctly.
+    """
+
+    if not field.is_decimal():
+        return field
+
+    precision, scale = field.decimal_parameters()
+
+    if precision is None or aggregate.lower() != "sum":
+        return field
+
+    scale = scale or 0
+    precision = precision + DECIMAL_SUM_PRECISION_INCREMENT
+
+    return field.clone(precision=precision, scale=scale)
 
 
 class FieldList(object):
@@ -406,6 +492,7 @@ class FieldList(object):
             field = self.field(field)
             field = field.clone(name="%s_%s" % (str(field), aggregate),
                                 analytical_type="measure")
+            field = aggregated_field(field, aggregate)
             agg_fields.append(field)
 
         if include_count:

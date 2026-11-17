@@ -1,10 +1,13 @@
 import functools
 from ...operation import RetryOperation
 from ...prototypes import *
-from ...metadata import Field, FieldList, FieldFilter
+from ...metadata import Field, FieldList, FieldFilter, aggregated_field
 from ...metadata import prepare_aggregation_list, prepare_order_list
 from ...objects import IterableDataSource
 from ...errors import *
+from .types import (SQLDecimal, decimal_sort_key_expression,
+                    decimal_sort_key_value)
+from .objects import InsertFromSelect
 from .utils import prepare_key, zip_condition, join_on_clause
 
 try:
@@ -23,6 +26,123 @@ def _unary(func):
         return obj.clone_statement(statement=result)
 
     return decorator
+
+
+#############################################################################
+# Exact decimal helpers
+
+def _is_sqlite(obj):
+    try:
+        return obj.store.connectable.dialect.name == "sqlite"
+    except AttributeError:
+        return False
+
+
+def _decimal_sort_expression(obj, column, field):
+    """Return an expression that orders and compares a decimal `column`
+    numerically."""
+
+    if not _is_sqlite(obj):
+        return column
+
+    return decimal_sort_key_expression(column, field)
+
+
+def _decimal_sort_key_value(field, value):
+    """Return a sort key string for a Python `value` of a decimal `field`."""
+    return decimal_sort_key_value(value, field)
+
+
+def _decimal_aggregate_expression(obj, field, column, aggregate):
+    """Return an SQL expression for an aggregation of a decimal `column`.
+
+    SQLite does not have native decimal arithmetic, exact aggregates over the
+    text representation are used instead.  The result is coerced to a
+    decimal type with a widened integer part.
+    """
+
+    result_field = aggregated_field(field, aggregate)
+    result_type = SQLDecimal(result_field.precision, result_field.scale)
+
+    if _is_sqlite(obj):
+        if aggregate == "sum":
+            expression = sqlalchemy.func.bubbles_decimal_sum(column)
+        elif aggregate == "min":
+            expression = sqlalchemy.func.bubbles_decimal_min(column)
+        elif aggregate == "max":
+            expression = sqlalchemy.func.bubbles_decimal_max(column)
+        else:
+            raise OperationError("Unknown decimal aggregation '%s'"
+                                 % aggregate)
+    else:
+        try:
+            func = aggregation_functions[aggregate]
+        except KeyError:
+            raise OperationError("Unknown aggregation '%s'" % aggregate)
+        expression = func(column)
+
+    return sqlalchemy.type_coerce(expression, result_type)
+
+
+def _decimal_text_value(field, value, allow_null=True):
+    """Return the canonical stored text for a decimal filter `value`."""
+
+    from ...numeric import coerce_decimal, decimal_text
+
+    if value is None:
+        if allow_null:
+            return None
+        raise DecimalError("NULL can not be used here as a decimal value")
+
+    precision, scale = field.decimal_parameters()
+    # Filter values are coerced to the field's scale; they have to be exact.
+    coerce_decimal(value, precision, scale)
+    return decimal_text(value, precision, scale)
+
+
+def _and_condition(conditions):
+    conditions = [condition for condition in conditions
+                                    if condition is not None]
+    if not conditions:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return sql.expression.and_(*conditions)
+
+
+def _range_condition(obj, field, column, low, high, operation):
+    """Return a range condition for `column`.
+
+    `operation` is ``lt``, ``le``, ``gt``, ``ge`` or ``between``. For
+    decimals stored as text an order-preserving sort key comparison is used.
+    """
+
+    if field is not None and field.is_decimal() and _is_sqlite(obj):
+        key = _decimal_sort_expression(obj, column, field)
+        low_key = None if low is None else _decimal_sort_key_value(field, low)
+        high_key = None if high is None else _decimal_sort_key_value(field,
+                                                                     high)
+        if operation == "between":
+            return sql.expression.between(key, low_key, high_key)
+        if operation == "lt":
+            return key < low_key
+        if operation == "le":
+            return key <= low_key
+        if operation == "gt":
+            return key > low_key
+        return key >= low_key
+
+    if operation == "between":
+        return sql.expression.between(column, low, high)
+    if operation == "lt":
+        return column < low
+    if operation == "le":
+        return column <= low
+    if operation == "gt":
+        return column > low
+    return column >= low
+
+
 
 #############################################################################
 # Metadata Operations
@@ -70,10 +190,22 @@ def _(ctx, src, key, value, discard=False):
 
     cols = src.columns()
     statement = src.sql_statement()
-    filter_cols = src.columns(prepare_key(key))
+    keys = prepare_key(key)
+    filter_cols = src.columns(keys)
     if len(filter_cols) == 1:
         value = (value, )
-    condition = zip_condition(filter_cols, value)
+
+    conditions = []
+    for field_key, filter_col, item in zip(keys, filter_cols, value):
+        field = src.fields.field(field_key)
+        if field.is_decimal() and item is not None:
+            # Decimals are stored in a canonical text form, therefore exact
+            # equality is achieved by comparing the canonical text.
+            item = _decimal_text_value(field, item)
+
+        conditions.append(filter_col == item)
+
+    condition = _and_condition(conditions)
     statement = sql.expression.select(cols, from_obj=statement,
                                         whereclause=condition)
 
@@ -86,14 +218,17 @@ def _(ctx, src, field, low, high, discard=False):
     """Filter by range: field should be between low and high."""
 
     statement = src.sql_statement()
-    key_column = statement.c[str(key)]
+    key = str(field)
+    key_column = statement.c[key]
+    field_obj = src.fields.field(key)
 
     if low is not None and high is None:
-        cond = key_column >= low
+        cond = _range_condition(src, field_obj, key_column, low, None, "ge")
     elif high is not None and low is None:
-        cond = key_column < high
+        cond = _range_condition(src, field_obj, key_column, high, None, "lt")
     else:
-        cond = sql.expression.between(key_column, low, high)
+        cond = _range_condition(src, field_obj, key_column, low, high,
+                                "between")
 
     if discard:
         cond = sql.expression.not_(cond)
@@ -167,8 +302,7 @@ def _(ctx, statement, value, mode="first"):
 
 
 @sort.register("sql")
-@_unary
-def _(ctx, statement, orderby):
+def _(ctx, obj, orderby):
     """Returns a ordered SQL statement. `orders` should be a list of
     two-element tuples `(field, order)`"""
 
@@ -177,24 +311,30 @@ def _(ctx, statement, orderby):
     # selected columns and derived aggregates
 
     orderby = prepare_order_list(orderby)
+    statement = obj.sql_statement()
 
     columns = []
     for field, order in orderby:
         column = statement.c[str(field)]
+        field_obj = obj.fields.field(field)
+        if field_obj.is_decimal():
+            column = _decimal_sort_expression(obj, column, field_obj)
+
         order = order.lower()
         if order.startswith("asc"):
             column = column.asc()
         elif order.startswith("desc"):
             column = column.desc()
         else:
-            raise ValueError("Unknown order %s for column %s") % (order, column)
+            raise ValueError("Unknown order %s for column %s" % (order,
+                                                                 field))
 
         columns.append(column)
 
     statement = sql.expression.select(statement.columns,
                                    from_obj=statement,
                                    order_by=columns)
-    return statement
+    return obj.clone_statement(statement=statement)
 
 aggregation_functions = {
     "sum": sql.functions.sum,
@@ -228,10 +368,21 @@ def _(ctx, obj, key, measures=None, include_count=True,
     selection = [statement.c[str(key)] for key in keys]
 
     for measure, agg_name in measures:
-        func = aggregation_functions[agg_name]
+        field_obj = obj.fields.field(str(measure))
         label = "%s_%s" % (str(measure), agg_name)
-        aggregation = func(obj.column(measure)).label(label)
-        selection.append(aggregation)
+
+        if field_obj.is_decimal():
+            aggregation = _decimal_aggregate_expression(
+                                    obj, field_obj, obj.column(measure),
+                                    agg_name)
+        else:
+            try:
+                func = aggregation_functions[agg_name]
+            except KeyError:
+                raise OperationError("Unknown aggregation '%s'" % agg_name)
+            aggregation = func(obj.column(measure))
+
+        selection.append(aggregation.label(label))
 
     if include_count:
         count = sql.functions.count(1).label(count_field)
@@ -834,7 +985,7 @@ def _(ctx, obj):
 
 @insert.register("sql", "sql")
 def _(ctx, source, target):
-    if not target.can_compose(src):
+    if not target.can_compose(source):
         raise RetryOperation(["rows"])
 
     # Flush all data that were added through append() to preserve

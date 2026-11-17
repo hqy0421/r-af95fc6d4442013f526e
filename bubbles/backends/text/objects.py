@@ -11,6 +11,7 @@ from ...metadata import *
 from ...errors import *
 from ...resource import Resource
 from ...stores import DataStore
+from ...numeric import (DECIMAL_STORAGE_TYPE, coerce_decimal, decimal_text)
 import json
 from datetime import datetime
 from time import strptime
@@ -203,8 +204,31 @@ class CSVSource(DataObject):
     def set_fields(self, fields):
         self.converters = [self.type_converters.get(f.storage_type) for f in fields]
 
+        # Decimal fields are always validated and converted exactly, they
+        # take precedence over user supplied converters.
+        self.decimal_fields = []
+        for i, field in enumerate(fields):
+            if field.storage_type == DECIMAL_STORAGE_TYPE:
+                precision, scale = field.decimal_parameters()
+                self.decimal_fields.append( (i, precision, scale) )
+            else:
+                self.decimal_fields.append(None)
+
         if not any(self.converters):
             self.converters = None
+
+    def _convert_value(self, index, value):
+        decimal = self.decimal_fields[index]
+        if decimal:
+            precision, scale = decimal[1], decimal[2]
+            return coerce_decimal(value, precision, scale)
+
+        func = self.converters[index] if self.converters else None
+
+        if func:
+            return func(value)
+
+        return value
 
     def release(self):
         if self.resource:
@@ -228,12 +252,7 @@ class CSVSource(DataObject):
                     result.append(None)
                     continue
 
-                func = self.converters[i] if self.converters else None
-
-                if func:
-                    result.append(func(value))
-                else:
-                    result.append(value)
+                result.append(self._convert_value(i, value))
             yield result
 
     def csv_stream(self):
@@ -241,7 +260,21 @@ class CSVSource(DataObject):
 
     def records(self):
         fields = self.fields.names()
+        decimal_indexes = [i for i, decimal in enumerate(self.decimal_fields)
+                           if decimal]
+        missing_values = [f.missing_value for f in self.fields]
+
         for row in self.reader:
+            if decimal_indexes:
+                row = list(row)
+                for i in decimal_indexes:
+                    value = row[i]
+                    if self.empty_as_null and not value:
+                        row[i] = None
+                    elif missing_values[i] and value == missing_values[i]:
+                        row[i] = None
+                    else:
+                        row[i] = self._convert_value(i, value)
             yield dict(zip(fields, row))
 
     def is_consumable(self):
@@ -318,12 +351,33 @@ class CSVTarget(DataObject):
 
         self.field_names = self.fields.names()
 
+        # Decimal values are validated and written in canonical form so that
+        # reading the file back yields the exact same values.
+        self.decimal_fields = []
+        for field in self.fields:
+            if field.storage_type == DECIMAL_STORAGE_TYPE:
+                self.decimal_fields.append(field.decimal_parameters())
+            else:
+                self.decimal_fields.append(None)
+
     def finalize(self):
         if self.handle:
             self.handle.close()
 
     def append(self, row):
+        if any(self.decimal_fields):
+            row = list(row)
+            for index in range(min(len(row), len(self.decimal_fields))):
+                row[index] = self._decimal_text(index, row[index])
         self.writer.writerow(row)
+
+    def _decimal_text(self, index, value):
+        decimal = self.decimal_fields[index]
+        if not decimal:
+            return value
+
+        precision, scale = decimal
+        return decimal_text(value, precision, scale)
 
     def append_from(self, obj):
         for row in obj:

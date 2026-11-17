@@ -248,7 +248,8 @@ class IterableDataSource(DataObject):
         return iter(self.iterable)
 
     def records(self):
-        return as_records(self.iterable, self.fields)
+        names = [str(field) for field in self.fields]
+        return (dict(zip(names, row)) for row in self.iterable)
 
     def is_consumable(self):
         return True
@@ -341,7 +342,8 @@ class RowListDataObject(DataObject):
         return iter(self.data)
 
     def records(self):
-        return as_records(self.rows(), self.fields)
+        names = [str(field) for field in self.fields]
+        return (dict(zip(names, row)) for row in self.data)
 
     def is_consumable(self):
         return False
